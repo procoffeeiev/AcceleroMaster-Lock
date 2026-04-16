@@ -17,10 +17,10 @@ int state = 0;
 signal key;
 signal ans;
 void setup() {
-  Serial.begin(9600);
+  serial.begin(9600);
   delay(100); // spi config
-  SPI.begin();
-  DDRB |= (1 << PB4);
+  spi.begin();
+  ddrb |= (1 << pb4);
   PORTB |= (1 << PB4);
   PORTB &= ~(1 << PB4);
   SPI.transfer(CFG1REG);
