@@ -10,12 +10,10 @@
 #define INCREG   0x40
 #define AXREG    0x28
 #define CFG1REG  0x20
-#define WHOAMI_REG 0x0F
-#define LIS3DH_WHO_AM_I 0x33u
 
-// Left PD4 / right PF6: internal pull-ups on, pressed reads LOW (active-low).
-#define BTN_L  (!(PIND & (1<<PD4)))
-#define BTN_R  (!(PINF & (1<<PF6)))
+// Left btn=PD4  Right btn=PF6  LED=PC7
+#define BTN_L  (PIND & (1<<PD4))
+#define BTN_R  (PINF & (1<<PF6))
 #define LED_ON  PORTC |=  (1<<PC7)
 #define LED_OFF PORTC &= ~(1<<PC7)
 
@@ -35,15 +33,14 @@ typedef struct {
   int16_t len;
 } signal;
 
-// ── State machine (actual code paths) ───────────────────────────────────────
-// After reset: first-time key → STATE_REC_WAIT (no key yet; not LOCKED). setup() does this.
-// LOCKED     all red.  R=start unlock  (L unused). L never starts record here; use UNLOCKED→change pw.
-// REC_WAIT   L=start recording gesture  R=cancel (→ prior: UNLOCKED if key existed, or reset if none)
-// REC_CAP    streaming samples.  R=cancel → REC_WAIT. Filled buffer → next REC_WAIT or LOCKED+saved.
-// UNL_WAIT   R=start capture  L=cancel → LOCKED
-// UNL_CAP    streaming.  L=cancel this attempt → UNL_WAIT. Full buffer → match → UNL_WAIT/UNLOCKED/FAILED
-// FAILED     red blink  → UNL_WAIT (retry from gesture 0)
-// UNLOCKED   all green.  L=lock → LOCKED  R=change password → REC_WAIT
+// ── State machine ─────────────────────────────────────────────────────────────
+// LOCKED    all red.    L=set pw (first time)  R=start unlock attempt
+// REC_WAIT  sequence display.  L=capture next  R=cancel → LOCKED
+// REC_CAP   capturing.  done→REC_WAIT or LOCKED (white flash)
+// UNL_WAIT  sequence display.  R=capture next  L=cancel → LOCKED
+// UNL_CAP   capturing.  match→UNL_WAIT or UNLOCKED  fail→FAILED
+// FAILED    blink red → UNL_WAIT gi=0  (first 3 remain yellow, retry)
+// UNLOCKED  all green.  L=lock  R=change pw → REC_WAIT
 #define STATE_LOCKED    0
 #define STATE_REC_WAIT  1
 #define STATE_REC_CAP   2
@@ -141,31 +138,23 @@ static void record(signal &a) {
 }
 
 static float matchCosine(signal &k,signal &a){
-  int n = k.len < a.len ? k.len : a.len;
-  if (n < 1) return 0;
   float d=0,nk=0,na=0;
-  for(int i=0;i<n;i++){d+=(float)k.x[i]*a.x[i]+(float)k.y[i]*a.y[i]+(float)k.z[i]*a.z[i];nk+=(float)k.x[i]*k.x[i]+(float)k.y[i]*k.y[i]+(float)k.z[i]*k.z[i];na+=(float)a.x[i]*a.x[i]+(float)a.y[i]*a.y[i]+(float)a.z[i]*a.z[i];}
+  for(int i=0;i<SIGLEN;i++){d+=(float)k.x[i]*a.x[i]+(float)k.y[i]*a.y[i]+(float)k.z[i]*a.z[i];nk+=(float)k.x[i]*k.x[i]+(float)k.y[i]*k.y[i]+(float)k.z[i]*k.z[i];na+=(float)a.x[i]*a.x[i]+(float)a.y[i]*a.y[i]+(float)a.z[i]*a.z[i];}
   if(nk<1||na<1)return 0;return d/(sqrtf(nk)*sqrtf(na));
 }
 static float matchPearson(signal &k,signal &a){
-  int n = k.len < a.len ? k.len : a.len;
-  if (n < 1) return 0;
   int16_t *kA[3]={k.x,k.y,k.z},*aA[3]={a.x,a.y,a.z};float rSum=0;int cnt=0;
-  for(int ax=0;ax<3;ax++){float mk=0,ma=0;for(int i=0;i<n;i++){mk+=kA[ax][i];ma+=aA[ax][i];}mk/=n;ma/=n;float cov=0,vk=0,va=0;for(int i=0;i<n;i++){float dk=kA[ax][i]-mk,da=aA[ax][i]-ma;cov+=dk*da;vk+=dk*dk;va+=da*da;}if(vk<1||va<1)continue;rSum+=cov/sqrtf(vk*va);cnt++;}
+  for(int ax=0;ax<3;ax++){float mk=0,ma=0;for(int i=0;i<SIGLEN;i++){mk+=kA[ax][i];ma+=aA[ax][i];}mk/=SIGLEN;ma/=SIGLEN;float cov=0,vk=0,va=0;for(int i=0;i<SIGLEN;i++){float dk=kA[ax][i]-mk,da=aA[ax][i]-ma;cov+=dk*da;vk+=dk*dk;va+=da*da;}if(vk<1||va<1)continue;rSum+=cov/sqrtf(vk*va);cnt++;}
   return cnt>0?rSum/cnt:0;
 }
 static float matchGradient(signal &k,signal &a){
-  int n = k.len < a.len ? k.len : a.len;
-  if (n < 2) return 0;
   float d=0,nk=0,na=0;
-  for(int i=0;i<n-1;i++){float kx=k.x[i+1]-k.x[i],ky=k.y[i+1]-k.y[i],kz=k.z[i+1]-k.z[i],ax=a.x[i+1]-a.x[i],ay=a.y[i+1]-a.y[i],az=a.z[i+1]-a.z[i];d+=kx*ax+ky*ay+kz*az;nk+=kx*kx+ky*ky+kz*kz;na+=ax*ax+ay*ay+az*az;}
+  for(int i=0;i<SIGLEN-1;i++){float kx=k.x[i+1]-k.x[i],ky=k.y[i+1]-k.y[i],kz=k.z[i+1]-k.z[i],ax=a.x[i+1]-a.x[i],ay=a.y[i+1]-a.y[i],az=a.z[i+1]-a.z[i];d+=kx*ax+ky*ay+kz*az;nk+=kx*kx+ky*ky+kz*kz;na+=ax*ax+ay*ay+az*az;}
   if(nk<1||na<1)return 0;return d/(sqrtf(nk)*sqrtf(na));
 }
 static float matchEnergy(signal &k,signal &a){
-  int n = k.len < a.len ? k.len : a.len;
-  if (n < 1) return 0;
   float kx=0,ky=0,kz=0,ax=0,ay=0,az=0;
-  for(int i=0;i<n;i++){kx+=(float)k.x[i]*k.x[i];ky+=(float)k.y[i]*k.y[i];kz+=(float)k.z[i]*k.z[i];ax+=(float)a.x[i]*a.x[i];ay+=(float)a.y[i]*a.y[i];az+=(float)a.z[i]*a.z[i];}
+  for(int i=0;i<SIGLEN;i++){kx+=(float)k.x[i]*k.x[i];ky+=(float)k.y[i]*k.y[i];kz+=(float)k.z[i]*k.z[i];ax+=(float)a.x[i]*a.x[i];ay+=(float)a.y[i]*a.y[i];az+=(float)a.z[i]*a.z[i];}
   float kt=kx+ky+kz,at=ax+ay+az;if(kt<1||at<1)return 0;
   return 1-(fabsf(kx/kt-ax/at)+fabsf(ky/kt-ay/at)+fabsf(kz/kt-az/at))*0.5f;
 }
@@ -185,26 +174,10 @@ void setup() {
   strip.begin();strip.setBrightness(120);
   delay(100);SPI.begin();
   DDRB|=(1<<PB4);PORTB|=(1<<PB4);
-  {
-    uint8_t who = spiRead8(WHOAMI_REG);
-    if (who != (uint8_t)LIS3DH_WHO_AM_I) {
-      Serial.print(F("LIS3DH WHO_AM_I read 0x"));
-      Serial.print(who, HEX);
-      Serial.println(F(" (expect 0x33). HALT: check SPI / sensor."));
-      while (1) {
-        delay(250);
-        if (((uint32_t)millis() >> 8) & 1U) LED_ON; else LED_OFF;
-      }
-    }
-    Serial.println(F("LIS3DH WHO_AM_I ok (0x33)."));
-  }
   PORTB&=~(1<<PB4);SPI.transfer(CFG1REG);SPI.transfer(0x47);PORTB|=(1<<PB4);
   delay(1000);
   gi=0; showRecSeq(0); state=STATE_REC_WAIT;
-  Serial.println(F("Accel-only (X/Y/Z). Gyro not used."));
   Serial.println(F("No key — set password."));
-  Serial.println(F("During capture: R=cancel record, L=cancel unlock sample."));
-  Serial.println(F("Serial: send 0-3 to pick match algo (dev; retune THRESHOLDS per mode)."));
 }
 
 void loop() {
@@ -239,14 +212,6 @@ void loop() {
     break;
 
   case STATE_REC_CAP:
-    if (btnR) {
-      key[gi].len = 0;
-      LED_OFF;
-      showRecSeq(gi);
-      state = STATE_REC_WAIT;
-      Serial.println(F("Record capture cancelled."));
-      break;
-    }
     record(key[gi]);
     if(key[gi].len&8)LED_ON;else LED_OFF;
     if(key[gi].len%10==0) showCapProgress(gi,key[gi].len,true);
@@ -275,14 +240,6 @@ void loop() {
     break;
 
   case STATE_UNL_CAP:
-    if (btnL) {
-      ans.len = 0;
-      LED_OFF;
-      showUnlSeq(gi);
-      state = STATE_UNL_WAIT;
-      Serial.println(F("Unlock capture cancelled."));
-      break;
-    }
     record(ans);
     if(ans.len&8)LED_ON;else LED_OFF;
     if(ans.len%10==0) showCapProgress(gi,ans.len,false);
