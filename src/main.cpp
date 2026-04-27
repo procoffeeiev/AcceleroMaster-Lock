@@ -7,8 +7,11 @@
 #define INCREG  0x40
 #define AXREG   0x28
 #define CFG1REG 0x20
+#define WAIREG  0x0F
+#define WAI_OK  0x33
 #define SIGLEN 50
 #define NUM_GESTURES 3
+#define SPEAKER_PIN 5
 
 #define ALGO_COSINE  // swap to ALGO_PEARSON, ALGO_GRADIENT, or ALGO_ENERGY
 
@@ -33,10 +36,13 @@ static void showAll(uint8_t r, uint8_t g, uint8_t b);
 static void showGestures(int cur, int len, bool isRec);
 static void readAccel(Signal &s);
 static bool match(Signal &k, Signal &a);
+static void beep(uint16_t hz, uint16_t ms);
+static uint8_t spiRead8(uint8_t reg);
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
+    pinMode(SPEAKER_PIN, OUTPUT); noTone(SPEAKER_PIN);
     DDRD &= ~(1 << PD4); PORTD &= ~(1 << PD4);
     DDRF &= ~(1 << PF6); PORTF &= ~(1 << PF6);
     DDRC |= (1 << PC7);
@@ -45,6 +51,10 @@ void setup() {
     delay(100); SPI.begin();
 
     DDRB |= (1 << PB4); PORTB |= (1 << PB4);
+    if (spiRead8(WAIREG) != WAI_OK) {            // accel didn't answer — halt + audible alarm
+        showAll(60, 0, 0);
+        while (1) { beep(180, 200); delay(800); }
+    }
     PORTB &= ~(1 << PB4);
     SPI.transfer(CFG1REG); SPI.transfer(0x47);
     PORTB |= (1 << PB4);
@@ -66,8 +76,11 @@ REC_CAP:
     if (key[gi].len % 10 == 0) showGestures(gi, key[gi].len, true);
     if (key[gi].len < SIGLEN) goto REC_CAP;
     PORTC &= ~(1 << PC7);
+    beep((uint16_t)(520 + gi * 120), 55);
     if (++gi < NUM_GESTURES) { showGestures(gi, -1, true); goto REC_WAIT; }
-    keySet = true; showAll(20, 20, 20); delay(500); showAll(15, 0, 0);
+    keySet = true; showAll(20, 20, 20); delay(500);
+    beep(784, 70); beep(988, 90);
+    showAll(15, 0, 0);
     goto LOCKED;
 
 LOCKED:
@@ -94,8 +107,9 @@ UNL_CAP:
     if (ans.len % 10 == 0) showGestures(gi, ans.len, false);
     if (ans.len < SIGLEN) goto UNL_CAP;
     PORTC &= ~(1 << PC7);
-    if (!match(key[gi], ans)) { showAll(60, 0, 0); goto FAILED; }
-    if (++gi < NUM_GESTURES) { showGestures(gi, -1, false); goto UNL_WAIT; }
+    if (!match(key[gi], ans)) { beep(180, 160); showAll(60, 0, 0); goto FAILED; }
+    if (++gi < NUM_GESTURES) { beep(880, 45); showGestures(gi, -1, false); goto UNL_WAIT; }
+    beep(523, 50); beep(659, 50); beep(784, 80);
     showAll(0, 60, 0);
     goto UNLOCKED;
 
@@ -147,6 +161,20 @@ static void showGestures(int cur, int len, bool isRec) {
         }
     }
     strip.show();
+}
+
+static void beep(uint16_t hz, uint16_t ms) {
+    tone(SPEAKER_PIN, hz, ms);
+    delay((uint32_t)ms + 15U);
+    noTone(SPEAKER_PIN);
+}
+
+static uint8_t spiRead8(uint8_t reg) {
+    PORTB &= ~(1 << PB4);
+    SPI.transfer(reg | READREG);
+    uint8_t v = SPI.transfer(0xFF);
+    PORTB |= (1 << PB4);
+    return v;
 }
 
 static void readAccel(Signal &s) {
