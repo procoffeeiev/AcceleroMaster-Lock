@@ -3,243 +3,203 @@
 #include <Adafruit_NeoPixel.h>
 #include <math.h>
 
-#define NEO_COUNT  10
-#define READREG  0x80
-#define INCREG   0x40
-#define AXREG    0x28
-#define CFG1REG  0x20
+#define READREG 0x80
+#define INCREG  0x40
+#define AXREG   0x28
+#define CFG1REG 0x20
+#define SIGLEN 50
+#define NUM_GESTURES 3
 
-// Left btn=PD4  Right btn=PF6  LED=PC7
-#define BTN_L  (PIND & (1<<PD4))
-#define BTN_R  (PINF & (1<<PF6))
-#define LED_ON  PORTC |=  (1<<PC7)
-#define LED_OFF PORTC &= ~(1<<PC7)
-
-#define SIGLEN        50
-#define NUM_GESTURES   3
+#define ALGO_COSINE  // swap to ALGO_PEARSON, ALGO_GRADIENT, or ALGO_ENERGY
 
 typedef struct {
-  int16_t x[SIGLEN], y[SIGLEN], z[SIGLEN];
-  int16_t len;
-} signal;
+    int16_t x[SIGLEN];
+    int16_t y[SIGLEN];
+    int16_t z[SIGLEN];
+    int16_t len = 0;
+} Signal;
 
-// ── State machine ─────────────────────────────────────────────────────────────
-// LOCKED    all red.    L=set pw (first time)  R=start unlock attempt
-// REC_WAIT  sequence display.  L=capture next  R=cancel → LOCKED
-// REC_CAP   capturing.  done→REC_WAIT or LOCKED (white flash)
-// UNL_WAIT  sequence display.  R=capture next  L=cancel → LOCKED
-// UNL_CAP   capturing.  match→UNL_WAIT or UNLOCKED  fail→FAILED
-// FAILED    blink red → UNL_WAIT gi=0  (first 3 remain yellow, retry)
-// UNLOCKED  all green.  L=lock  R=change pw → REC_WAIT
-#define STATE_LOCKED    0
-#define STATE_REC_WAIT  1
-#define STATE_REC_CAP   2
-#define STATE_UNL_WAIT  3
-#define STATE_UNL_CAP   4
-#define STATE_FAILED    5
-#define STATE_UNLOCKED  6
+Adafruit_NeoPixel strip(10, 17, NEO_GRB + NEO_KHZ800);
 
-#define ALGO_COSINE   0
-#define ALGO_PEARSON  1
-#define ALGO_GRADIENT 2
-#define ALGO_ENERGY   3
-#define NUM_ALGOS     4
-const float THRESHOLDS[NUM_ALGOS] = {0.85f, 0.75f, 0.80f, 0.80f};
+static bool btnL, btnR, lastL = false, lastR = false;
+static bool keySet = false;
+static int gi = 0;
+static Signal key[NUM_GESTURES];
+static Signal ans;
 
-static int           state    = STATE_LOCKED;
-static int           algo     = ALGO_COSINE;
-static bool          keySet   = false;
-static int           gi       = 0;
-static unsigned long timer    = 0;
-static int           blinkCnt = 0;
-static bool          lastL    = false, lastR = false;
-static bool          btnL     = false, btnR  = false;
+// ── Forward declarations ──────────────────────────────────────────────────────
+static void tick();
+static void showAll(uint8_t r, uint8_t g, uint8_t b);
+static void showGestures(int cur, int len, bool isRec);
+static void readAccel(Signal &s);
+static bool match(Signal &k, Signal &a);
 
-static signal key[NUM_GESTURES];
-static signal ans;
-
-Adafruit_NeoPixel strip(NEO_COUNT, 17, NEO_GRB + NEO_KHZ800);
-
-static void showAll(uint8_t r, uint8_t g, uint8_t b) {
-  for (int i=0;i<NEO_COUNT;i++) strip.setPixelColor(i,strip.Color(r,g,b));
-  strip.show();
-}
-
-// Record: recorded=red  current=yellow  unrecorded=green
-static void showRecSeq(int cur) {
-  strip.clear();
-  for (int g=0;g<NUM_GESTURES;g++) {
-    uint32_t c = g<cur?strip.Color(20,0,0):g==cur?strip.Color(20,20,0):strip.Color(0,20,0);
-    strip.setPixelColor(g*3,c); strip.setPixelColor(g*3+1,c); strip.setPixelColor(g*3+2,c);
-  }
-  strip.show();
-}
-
-// Unlock: matched=green  current=yellow  locked=red
-static void showUnlSeq(int cur) {
-  strip.clear();
-  for (int g=0;g<NUM_GESTURES;g++) {
-    uint32_t c = g<cur?strip.Color(0,20,0):g==cur?strip.Color(20,20,0):strip.Color(20,0,0);
-    strip.setPixelColor(g*3,c); strip.setPixelColor(g*3+1,c); strip.setPixelColor(g*3+2,c);
-  }
-  strip.show();
-}
-
-// During capture: fill current gesture pixels as samples arrive
-static void showCapProgress(int cur, int16_t len, bool isRec) {
-  strip.clear();
-  for (int g=0;g<NUM_GESTURES;g++) {
-    if (g<cur) {
-      uint32_t c=isRec?strip.Color(20,0,0):strip.Color(0,20,0);
-      strip.setPixelColor(g*3,c);strip.setPixelColor(g*3+1,c);strip.setPixelColor(g*3+2,c);
-    } else if (g==cur) {
-      int f=(len*3)/SIGLEN;
-      for (int p=0;p<3;p++)
-        strip.setPixelColor(g*3+p, p<f?strip.Color(20,20,0):strip.Color(5,5,0));
-    } else {
-      uint32_t c=isRec?strip.Color(0,20,0):strip.Color(20,0,0);
-      strip.setPixelColor(g*3,c);strip.setPixelColor(g*3+1,c);strip.setPixelColor(g*3+2,c);
-    }
-  }
-  strip.show();
-}
-
-static void record(signal &a) {
-  PORTB &= ~(1<<PB4);
-  SPI.transfer(AXREG|READREG|INCREG);
-  uint8_t lo,hi;
-  lo=SPI.transfer(0xFF);hi=SPI.transfer(0xFF);a.x[a.len]=(int16_t)((hi<<8)|lo);
-  lo=SPI.transfer(0xFF);hi=SPI.transfer(0xFF);a.y[a.len]=(int16_t)((hi<<8)|lo);
-  lo=SPI.transfer(0xFF);hi=SPI.transfer(0xFF);a.z[a.len]=(int16_t)((hi<<8)|lo);
-  PORTB |= (1<<PB4);
-  a.len++;
-}
-
-static float matchCosine(signal &k,signal &a){
-  float d=0,nk=0,na=0;
-  for(int i=0;i<SIGLEN;i++){d+=(float)k.x[i]*a.x[i]+(float)k.y[i]*a.y[i]+(float)k.z[i]*a.z[i];nk+=(float)k.x[i]*k.x[i]+(float)k.y[i]*k.y[i]+(float)k.z[i]*k.z[i];na+=(float)a.x[i]*a.x[i]+(float)a.y[i]*a.y[i]+(float)a.z[i]*a.z[i];}
-  if(nk<1||na<1)return 0;return d/(sqrtf(nk)*sqrtf(na));
-}
-static float matchPearson(signal &k,signal &a){
-  int16_t *kA[3]={k.x,k.y,k.z},*aA[3]={a.x,a.y,a.z};float rSum=0;int cnt=0;
-  for(int ax=0;ax<3;ax++){float mk=0,ma=0;for(int i=0;i<SIGLEN;i++){mk+=kA[ax][i];ma+=aA[ax][i];}mk/=SIGLEN;ma/=SIGLEN;float cov=0,vk=0,va=0;for(int i=0;i<SIGLEN;i++){float dk=kA[ax][i]-mk,da=aA[ax][i]-ma;cov+=dk*da;vk+=dk*dk;va+=da*da;}if(vk<1||va<1)continue;rSum+=cov/sqrtf(vk*va);cnt++;}
-  return cnt>0?rSum/cnt:0;
-}
-static float matchGradient(signal &k,signal &a){
-  float d=0,nk=0,na=0;
-  for(int i=0;i<SIGLEN-1;i++){float kx=k.x[i+1]-k.x[i],ky=k.y[i+1]-k.y[i],kz=k.z[i+1]-k.z[i],ax=a.x[i+1]-a.x[i],ay=a.y[i+1]-a.y[i],az=a.z[i+1]-a.z[i];d+=kx*ax+ky*ay+kz*az;nk+=kx*kx+ky*ky+kz*kz;na+=ax*ax+ay*ay+az*az;}
-  if(nk<1||na<1)return 0;return d/(sqrtf(nk)*sqrtf(na));
-}
-static float matchEnergy(signal &k,signal &a){
-  float kx=0,ky=0,kz=0,ax=0,ay=0,az=0;
-  for(int i=0;i<SIGLEN;i++){kx+=(float)k.x[i]*k.x[i];ky+=(float)k.y[i]*k.y[i];kz+=(float)k.z[i]*k.z[i];ax+=(float)a.x[i]*a.x[i];ay+=(float)a.y[i]*a.y[i];az+=(float)a.z[i]*a.z[i];}
-  float kt=kx+ky+kz,at=ax+ay+az;if(kt<1||at<1)return 0;
-  return 1-(fabsf(kx/kt-ax/at)+fabsf(ky/kt-ay/at)+fabsf(kz/kt-az/at))*0.5f;
-}
-float match(signal &k,signal &a){
-  switch(algo){case ALGO_PEARSON:return matchPearson(k,a);case ALGO_GRADIENT:return matchGradient(k,a);case ALGO_ENERGY:return matchEnergy(k,a);default:return matchCosine(k,a);}
-}
+// ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
-  Serial.begin(9600);
-  DDRD&=~(1<<PD4);PORTD&=~(1<<PD4);
-  DDRF&=~(1<<PF6);PORTF&=~(1<<PF6);
-  DDRC|=(1<<PC7);
-  strip.begin();strip.setBrightness(120);
-  delay(100);SPI.begin();
-  DDRB|=(1<<PB4);PORTB|=(1<<PB4);
-  PORTB&=~(1<<PB4);SPI.transfer(CFG1REG);SPI.transfer(0x47);PORTB|=(1<<PB4);
-  delay(1000);
-  gi=0; showRecSeq(0); state=STATE_REC_WAIT;
-  Serial.println(F("No key — set password."));
+    DDRD &= ~(1 << PD4); PORTD &= ~(1 << PD4);
+    DDRF &= ~(1 << PF6); PORTF &= ~(1 << PF6);
+    DDRC |= (1 << PC7);
+
+    strip.begin(); strip.setBrightness(120);
+    delay(100); SPI.begin();
+
+    DDRB |= (1 << PB4); PORTB |= (1 << PB4);
+    PORTB &= ~(1 << PB4);
+    SPI.transfer(CFG1REG); SPI.transfer(0x47);
+    PORTB |= (1 << PB4);
+    delay(1000);
+
+    gi = 0; showGestures(0, -1, true);
+
+REC_WAIT:
+    tick();
+    if (btnL) { key[gi].len = 0; goto REC_CAP; }
+    if (btnR && keySet) { showAll(0, 60, 0); goto UNLOCKED; }
+    if (btnR) { gi = 0; showGestures(0, -1, true); }
+    goto REC_WAIT;
+
+REC_CAP:
+    tick();
+    readAccel(key[gi]);
+    if (key[gi].len & 8) PORTC |= (1 << PC7); else PORTC &= ~(1 << PC7);
+    if (key[gi].len % 10 == 0) showGestures(gi, key[gi].len, true);
+    if (key[gi].len < SIGLEN) goto REC_CAP;
+    PORTC &= ~(1 << PC7);
+    if (++gi < NUM_GESTURES) { showGestures(gi, -1, true); goto REC_WAIT; }
+    keySet = true; showAll(20, 20, 20); delay(500); showAll(15, 0, 0);
+    goto LOCKED;
+
+LOCKED:
+    tick();
+    if (btnR) { gi = 0; showGestures(0, -1, false); goto UNL_WAIT; }
+    goto LOCKED;
+
+UNLOCKED:
+    tick();
+    if (btnL) { showAll(15, 0, 0); goto LOCKED; }
+    if (btnR) { gi = 0; showGestures(0, -1, true); goto REC_WAIT; }
+    goto UNLOCKED;
+
+UNL_WAIT:
+    tick();
+    if (btnR) { ans.len = 0; goto UNL_CAP; }
+    if (btnL) { showAll(15, 0, 0); goto LOCKED; }
+    goto UNL_WAIT;
+
+UNL_CAP:
+    tick();
+    readAccel(ans);
+    if (ans.len & 8) PORTC |= (1 << PC7); else PORTC &= ~(1 << PC7);
+    if (ans.len % 10 == 0) showGestures(gi, ans.len, false);
+    if (ans.len < SIGLEN) goto UNL_CAP;
+    PORTC &= ~(1 << PC7);
+    if (!match(key[gi], ans)) { showAll(60, 0, 0); goto FAILED; }
+    if (++gi < NUM_GESTURES) { showGestures(gi, -1, false); goto UNL_WAIT; }
+    showAll(0, 60, 0);
+    goto UNLOCKED;
+
+FAILED:
+    {
+        int cnt = 0, t = 0;
+        while (cnt < 6) {
+            tick();
+            if (++t >= 20) {
+                t = 0;
+                if (cnt & 1) { strip.clear(); strip.show(); } else showAll(60, 0, 0);
+                cnt++;
+            }
+        }
+    }
+    gi = 0; showGestures(0, -1, false);
+    goto UNL_WAIT;
 }
 
-void loop() {
-  delay(10);
-  bool curL=BTN_L,curR=BTN_R;
-  btnL=curL&&!lastL;btnR=curR&&!lastR;
-  lastL=curL;lastR=curR;
+void loop() {}
 
-  if(Serial.available()){char c=Serial.read();if(c>='0'&&c<'0'+NUM_ALGOS){algo=c-'0';Serial.print(F("[dev] algo="));Serial.println(algo);}}
+// ─────────────────────────────────────────────────────────────────────────────
 
-  switch(state){
+static void tick() {
+    delay(10);
+    bool L = PIND & (1 << PD4);
+    bool R = PINF & (1 << PF6);
+    btnL = L && !lastL; btnR = R && !lastR;
+    lastL = L; lastR = R;
+}
 
-  case STATE_LOCKED:
-    if(btnR){ gi=0; showUnlSeq(0); state=STATE_UNL_WAIT; }
-    break;
+static void showAll(uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; i < 10; i++)
+        strip.setPixelColor(i, strip.Color(r, g, b));
+    strip.show();
+}
 
-  case STATE_UNLOCKED:
-    if(btnL){                               // lock
-      state=STATE_LOCKED; showAll(15,0,0);
-    }else if(btnR){                         // change password
-      gi=0; showRecSeq(0); state=STATE_REC_WAIT;
+static void showGestures(int cur, int len, bool isRec) {
+    uint32_t done = isRec ? strip.Color(20, 0, 0) : strip.Color(0, 20, 0);
+    uint32_t todo = isRec ? strip.Color(0, 20, 0) : strip.Color(20, 0, 0);
+    strip.clear();
+    for (int g = 0; g < NUM_GESTURES; g++) {
+        for (int p = 0; p < 3; p++) {
+            uint32_t c = g < cur ? done
+                       : g > cur ? todo
+                       : (len < 0 || p < len*3/SIGLEN) ? strip.Color(20, 20, 0)
+                       : strip.Color(5, 5, 0);
+            strip.setPixelColor(g*3+p, c);
+        }
     }
-    break;
+    strip.show();
+}
 
-  case STATE_REC_WAIT:                      // L=capture  R=cancel
-    if(btnL){
-      key[gi].len=0; state=STATE_REC_CAP;
-    }else if(btnR){
-      if(keySet){ state=STATE_UNLOCKED; showAll(0,60,0); } // cancel pw change → back unlocked
-      else{ gi=0; showRecSeq(0); }                         // no pw yet: reset, can't escape
-    }
-    break;
+static void readAccel(Signal &s) {
+    PORTB &= ~(1 << PB4);
+    SPI.transfer(AXREG | READREG | INCREG);
+    uint8_t lo, hi;
+    lo = SPI.transfer(0xFF); hi = SPI.transfer(0xFF); s.x[s.len] = (int16_t)((hi << 8) | lo);
+    lo = SPI.transfer(0xFF); hi = SPI.transfer(0xFF); s.y[s.len] = (int16_t)((hi << 8) | lo);
+    lo = SPI.transfer(0xFF); hi = SPI.transfer(0xFF); s.z[s.len] = (int16_t)((hi << 8) | lo);
+    PORTB |= (1 << PB4);
+    s.len++;
+}
 
-  case STATE_REC_CAP:
-    record(key[gi]);
-    if(key[gi].len&8)LED_ON;else LED_OFF;
-    if(key[gi].len%10==0) showCapProgress(gi,key[gi].len,true);
-    if(key[gi].len>=SIGLEN){
-      LED_OFF;
-      Serial.print(F("G"));Serial.print(gi);Serial.println(F(" saved"));
-      if(++gi<NUM_GESTURES){
-        showRecSeq(gi); state=STATE_REC_WAIT;
-      }else{
-        keySet=true; showAll(20,20,20); delay(500);
-        state=STATE_LOCKED; showAll(15,0,0);
-        Serial.println(F("Key saved."));
-      }
+static bool match(Signal &k, Signal &a) {
+    float d = 0, nk = 0, na = 0;
+#if defined(ALGO_PEARSON)
+    for (int ax = 0; ax < 3; ax++) {
+        int16_t *kA = ax==0?k.x:ax==1?k.y:k.z;
+        int16_t *aA = ax==0?a.x:ax==1?a.y:a.z;
+        float mk = 0, ma = 0;
+        for (int i = 0; i < SIGLEN; i++) { mk += kA[i]; ma += aA[i]; }
+        mk /= SIGLEN; ma /= SIGLEN;
+        float cov = 0, vk = 0, va = 0;
+        for (int i = 0; i < SIGLEN; i++) {
+            float dk = kA[i]-mk, da = aA[i]-ma;
+            cov += dk*da; vk += dk*dk; va += da*da;
+        }
+        if (vk < 1 || va < 1) continue;
+        d += cov/sqrtf(vk*va); nk += 1; na += 1;
     }
-    break;
-
-  case STATE_UNL_WAIT:                      // R=capture  L=cancel
-    if(btnR){
-      ans.len=0; state=STATE_UNL_CAP;
-    }else if(btnL){
-      state=STATE_LOCKED; showAll(15,0,0);
+    return nk >= 1 && d/nk >= 0.75f;
+#elif defined(ALGO_GRADIENT)
+    for (int i = 0; i < SIGLEN-1; i++) {
+        float kx=k.x[i+1]-k.x[i], ky=k.y[i+1]-k.y[i], kz=k.z[i+1]-k.z[i];
+        float ax=a.x[i+1]-a.x[i], ay=a.y[i+1]-a.y[i], az=a.z[i+1]-a.z[i];
+        d += kx*ax+ky*ay+kz*az; nk += kx*kx+ky*ky+kz*kz; na += ax*ax+ay*ay+az*az;
     }
-    break;
-
-  case STATE_UNL_CAP:
-    record(ans);
-    if(ans.len&8)LED_ON;else LED_OFF;
-    if(ans.len%10==0) showCapProgress(gi,ans.len,false);
-    if(ans.len>=SIGLEN){
-      LED_OFF;
-      float score=match(key[gi],ans);
-      bool ok=score>=THRESHOLDS[algo];
-      Serial.print(F("G"));Serial.print(gi);Serial.print(' ');Serial.print(score,4);Serial.println(ok?F(" OK"):F(" FAIL"));
-      if(!ok){
-        blinkCnt=0;timer=millis();state=STATE_FAILED;showAll(60,0,0);
-      }else if(++gi<NUM_GESTURES){
-        showUnlSeq(gi); state=STATE_UNL_WAIT;
-      }else{
-        state=STATE_UNLOCKED; showAll(0,60,0);
-        Serial.println(F("UNLOCKED"));
-      }
+    return nk >= 1 && na >= 1 && d/(sqrtf(nk)*sqrtf(na)) >= 0.80f;
+#elif defined(ALGO_ENERGY)
+    float kx=0,ky=0,kz=0,ax=0,ay=0,az=0;
+    for (int i = 0; i < SIGLEN; i++) {
+        kx+=(float)k.x[i]*k.x[i]; ky+=(float)k.y[i]*k.y[i]; kz+=(float)k.z[i]*k.z[i];
+        ax+=(float)a.x[i]*a.x[i]; ay+=(float)a.y[i]*a.y[i]; az+=(float)a.z[i]*a.z[i];
     }
-    break;
-
-  case STATE_FAILED:
-    if(millis()-timer>=200){
-      timer=millis();
-      if(blinkCnt&1){strip.clear();strip.show();}else showAll(60,0,0);
-      if(++blinkCnt>=6){
-        blinkCnt=0;
-        gi=0; showUnlSeq(0); state=STATE_UNL_WAIT;  // first 3 yellow, ready to retry
-        Serial.println(F("FAILED"));
-      }
+    float kt=kx+ky+kz, at=ax+ay+az;
+    return kt >= 1 && at >= 1 &&
+           1-(fabsf(kx/kt-ax/at)+fabsf(ky/kt-ay/at)+fabsf(kz/kt-az/at))*0.5f >= 0.80f;
+#else
+    for (int i = 0; i < SIGLEN; i++) {
+        d  += (float)k.x[i]*a.x[i]+(float)k.y[i]*a.y[i]+(float)k.z[i]*a.z[i];
+        nk += (float)k.x[i]*k.x[i]+(float)k.y[i]*k.y[i]+(float)k.z[i]*k.z[i];
+        na += (float)a.x[i]*a.x[i]+(float)a.y[i]*a.y[i]+(float)a.z[i]*a.z[i];
     }
-    break;
-  }
+    return nk >= 1 && na >= 1 && d/(sqrtf(nk)*sqrtf(na)) >= 0.85f;
+#endif
 }
